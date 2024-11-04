@@ -12,7 +12,6 @@ const uploadMiddleware = multer({ dest: "uploads/" });
 const fs = require("fs");
 require("dotenv").config();
 
-
 const SECRET_KEY = process.env.SECRET_KEY; // Change this to a secure, unique key
 
 app.use(
@@ -24,6 +23,15 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 app.use("/uploads", express.static(__dirname + "/uploads"));
+
+const cloudinary = require("cloudinary").v2;
+
+// Configure Cloudinary with credentials
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_URL.split("@")[1],
+  api_key: process.env.CLOUDINARY_URL.split("://")[1].split(":")[0],
+  api_secret: process.env.CLOUDINARY_URL.split(":")[2].split("@")[0],
+});
 
 mongoose.connect(process.env.MONGODB_URI);
 
@@ -132,25 +140,38 @@ app.post("/logout", (req, res) => {
 });
 
 app.post("/post", uploadMiddleware.single("file"), async (req, res) => {
-  const { originalname, path } = req.file;
-  const parts = originalname.split(".");
-  const ext = parts[parts.length - 1];
-  const newPath = path + "." + ext;
-  fs.renameSync(path, newPath);
-  const { token } = req.cookies;
-  jwt.verify(token, SECRET_KEY, {}, async (err, info) => {
-    if (err) throw err;
-    const { title, summary, content } = req.body;
-    const postDoc = await Post.create({
-      title,
-      summary,
-      content,
-      cover: newPath,
-      author: info.id,
-    });
+  const { path } = req.file; // Path to the uploaded image file on the server
 
-    res.json(postDoc);
-  });
+  // Upload to Cloudinary
+  cloudinary.uploader.upload(
+    path,
+    { folder: "uploads" },
+    async (error, result) => {
+      if (error)
+        return res
+          .status(500)
+          .json({ error: "Failed to upload to Cloudinary" });
+
+      // Clean up the local file after uploading to Cloudinary
+      fs.unlinkSync(path);
+
+      const { token } = req.cookies;
+      jwt.verify(token, SECRET_KEY, {}, async (err, info) => {
+        if (err) return res.status(401).json("Token verification failed");
+
+        const { title, summary, content } = req.body;
+        const postDoc = await Post.create({
+          title,
+          summary,
+          content,
+          cover: result.secure_url, // Use the Cloudinary URL for the image
+          author: info.id,
+        });
+
+        res.json(postDoc);
+      });
+    }
+  );
 });
 
 app.get("/post", async (req, res) => {
@@ -168,51 +189,43 @@ app.get("/post/:id", async (req, res) => {
 });
 
 app.put("/post/:id", uploadMiddleware.single("file"), async (req, res) => {
-  let newPath = null;
+  let coverUrl = null;
+
   if (req.file) {
-    const { originalname, path } = req.file;
-    const parts = originalname.split(".");
-    const ext = parts[parts.length - 1];
-    newPath = path + "." + ext;
-    fs.renameSync(path, newPath);
+    const { path } = req.file;
+
+    // Upload to Cloudinary
+    const uploadResult = await cloudinary.uploader.upload(path, {
+      folder: "uploads",
+    });
+    coverUrl = uploadResult.secure_url;
+
+    // Delete the local file after uploading to Cloudinary
+    fs.unlinkSync(path);
   }
 
   const { token } = req.cookies;
-
   jwt.verify(token, SECRET_KEY, {}, async (err, info) => {
-    if (err) {
-      return res.status(401).json("Token verification failed");
-    }
+    if (err) return res.status(401).json("Token verification failed");
 
-    try {
-      const { id, title, summary, content } = req.body;
-      const postDoc = await Post.findById(id);
+    const { id, title, summary, content } = req.body;
+    const postDoc = await Post.findById(id);
 
-      if (!postDoc) {
-        return res.status(404).json("Post not found");
-      }
+    if (!postDoc) return res.status(404).json("Post not found");
 
-      const isAuthor =
-        JSON.stringify(postDoc.author) === JSON.stringify(info.id);
-      console.log(postDoc.author, info.id);
-      if (!isAuthor) {
-        return res.status(403).json("You are not the author");
-      }
+    const isAuthor = JSON.stringify(postDoc.author) === JSON.stringify(info.id);
+    if (!isAuthor) return res.status(403).json("You are not the author");
 
-      // Update fields and save
-      postDoc.set({
-        title,
-        summary,
-        content,
-        cover: newPath ? newPath : postDoc.cover,
-      });
-      await postDoc.save();
+    // Update fields
+    postDoc.set({
+      title,
+      summary,
+      content,
+      cover: coverUrl ? coverUrl : postDoc.cover,
+    });
+    await postDoc.save();
 
-      res.json(postDoc);
-    } catch (error) {
-      console.error(error);
-      res.status(500).json("Internal server error");
-    }
+    res.json(postDoc);
   });
 });
 
